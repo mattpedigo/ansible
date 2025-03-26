@@ -1,0 +1,134 @@
+- name: Provision and Configure LXC Container on Proxmox
+  hosts: proxmox
+  gather_facts: no
+  vars_files:
+    - ../secrets.yml  # Include your encrypted vault file here
+  tasks:
+    # Create LXC Container on Proxmox
+    - name: Create LXC container
+      delegate_to: localhost
+      community.general.proxmox:
+        api_host: "192.168.0.2" # Use IP or hostname for Proxmox server
+        api_user: "root@pam"
+        api_token_id: "ansiblelxc"
+        api_token_secret: "{{ proxmox_secret }}"
+        node: "proxmox"
+        vmid: 200
+        hostname: "smartiaq"
+        ostemplate: "local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
+        storage: "local-lvm"
+        memory: 512
+        cores: 1
+        netif: '{"net0":"name=eth0,bridge=vmbr0,ip=dhcp"}'
+        state: present
+        pubkey: "{{ lookup('file', '~/.ssh/proxmox.pub') }}"
+
+    # Start the new LXC (container)
+    - name: Start LXC
+      delegate_to: localhost
+      community.general.proxmox:
+        api_host: "192.168.0.2"
+        api_user: "root@pam"
+        api_token_id: "ansiblelxc"
+        api_token_secret: "{{ proxmox_secret }}"
+        node: "proxmox"
+        vmid: 200
+        state: started
+
+    # Prepare LXC via Proxmox Host (Install SSH)
+    - name: Install SSH server directly on LXC container
+      shell: |
+        pct exec 200 -- apt-get update
+        pct exec 200 -- apt-get install -y openssh-server
+        pct exec 200 -- systemctl enable ssh
+        pct exec 200 -- systemctl start ssh
+
+    # Fetch LXC IP Address
+    - name: Get LXC container's IP address
+      shell: |
+        pct exec 200 -- hostname -I | awk '{print $1}'
+      register: lxc_ip_output
+
+    # Set LXC IP address as variable
+    - name: Set LXC container IP
+      set_fact:
+        lxc_ip: "{{ lxc_ip_output.stdout.strip() }}"
+        cacheable: yes
+ 
+    # Add LXC to inventory to reference later
+    - name: Add LXC container to inventory
+      add_host:
+        name: lxc_container
+        ansible_host: "{{ lxc_ip }}"
+        ansible_user: root
+        ansible_ssh_private_key_file: ~/.ssh/proxmox
+        ansible_become: yes
+
+- name: Configure LXC Container
+  hosts: lxc_container
+  gather_facts: no
+  vars:
+    lxc_ip: "{{ hostvars['proxmox']['lxc_ip'] }}"
+  vars_files:
+    - ../secrets.yml  # Include your encrypted vault file here
+  tasks:
+    # Add the newly created LXC host key to known_hosts to mitigate console prompt
+    - name: Add LXC host key to known_hosts
+      shell: ssh-keyscan -H {{ lxc_ip }} >> ~/.ssh/known_hosts
+      delegate_to: localhost
+
+    # Get the key from secrets.yml and create the file on LXC
+    - name: Write SSH private key to LXC
+      copy:
+        content: "{{ github_key }}"
+        dest: "/etc/ssh/github_id_rsa"
+        mode: '0600'
+      become: yes
+
+    # Install Git
+    - name: Install git
+      apt:
+        name: git
+        state: present
+        update_cache: yes
+      become: yes
+
+    # Clone GitHub Repository
+    - name: Clone GitHub repository
+      git:
+        repo: "git@github.com:mattpedigo/smartiaq.git" # Set repo to application for hosting
+        dest: "/var/www/node-app"
+        version: "main"
+        force: yes
+        key_file: "/etc/ssh/github_id_rsa"
+        accept_hostkey: yes
+        ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+      become: yes
+
+    # Install Node.js, NPM
+    - name: Install Node.js
+      shell: |
+        curl -sL https://deb.nodesource.com/setup_14.x | bash -
+        apt-get install -y nodejs npm
+      become: yes
+
+    # Install PM2 for persistence
+    - name: Install PM2
+      npm:
+        name: pm2
+        global: yes
+      become: yes
+
+    # Start the Node.js Application
+    - name: Start the Node.js application using PM2
+      shell: |
+        cd /var/www/node-app
+        npm install
+        pm2 start npm --name "node-app" -- start
+        pm2 save
+      become: yes
+
+    # Output Container's IP Address
+    - name: Display the LXC container's IP address
+      debug:
+        msg: "The app is running and accessible at http://{{ lxc_ip }}:3000"
