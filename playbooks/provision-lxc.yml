@@ -5,6 +5,20 @@
   vars_files:
     - ../secrets.yml  # Include your encrypted vault file here
   tasks:
+    - name: Check if LXC container exists
+      shell: "pct status {{ proxmox_vmid }}"
+      register: lxc_status
+      ignore_errors: yes
+
+    - name: Stop LXC container if it's running
+      shell: "pct stop {{ proxmox_vmid }}"
+      when: lxc_status.rc == 0
+      ignore_errors: yes
+
+    - name: Remove existing LXC container
+      shell: "pct destroy {{ proxmox_vmid }} --force"
+      when: lxc_status.rc == 0
+
     # Create LXC Container on Proxmox
     - name: Create LXC container
       delegate_to: localhost
@@ -14,8 +28,8 @@
         api_token_id: "ansiblelxc"
         api_token_secret: "{{ proxmox_secret }}"
         node: "proxmox"
-        vmid: 200
-        hostname: "smartiaq"
+        vmid: "{{ proxmox_vmid }}"
+        hostname: "{{ app_name }}"
         ostemplate: "local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
         storage: "local-lvm"
         memory: 512
@@ -33,21 +47,21 @@
         api_token_id: "ansiblelxc"
         api_token_secret: "{{ proxmox_secret }}"
         node: "proxmox"
-        vmid: 200
+        vmid: "{{ proxmox_vmid }}"
         state: started
 
     # Prepare LXC via Proxmox Host (Install SSH)
     - name: Install SSH server directly on LXC container
       shell: |
-        pct exec 200 -- apt-get update
-        pct exec 200 -- apt-get install -y openssh-server
-        pct exec 200 -- systemctl enable ssh
-        pct exec 200 -- systemctl start ssh
+        pct exec {{ proxmox_vmid }} -- apt-get update
+        pct exec {{ proxmox_vmid }} -- apt-get install -y openssh-server
+        pct exec {{ proxmox_vmid }} -- systemctl enable ssh
+        pct exec {{ proxmox_vmid }} -- systemctl start ssh
 
     # Fetch LXC IP Address
     - name: Get LXC container's IP address
       shell: |
-        pct exec 200 -- hostname -I | awk '{print $1}'
+        pct exec {{ proxmox_vmid }} -- hostname -I | awk '{print $1}'
       register: lxc_ip_output
 
     # Set LXC IP address as variable
@@ -97,7 +111,7 @@
     # Clone GitHub Repository
     - name: Clone GitHub repository
       git:
-        repo: "git@github.com:mattpedigo/smartiaq.git" # Set repo to application for hosting
+        repo: "{{ github_repo_url }}" # Set repo to application for hosting
         dest: "/var/www/node-app"
         version: "main"
         force: yes
@@ -143,8 +157,42 @@
       ansible.builtin.apt:
         deb: /tmp/cloudflared.deb
 
+    - name: Lookup tunnels
+      uri:
+        url: "https://api.cloudflare.com/client/v4/accounts/{{ cloudflare_account_id }}/cfd_tunnel"
+        method: GET
+        headers:
+          X-Auth-Key: "{{ cloudflare_api_key }}"
+          X-Auth-Email: "{{ cloudflare_email }}"
+          Content-Type: "application/json"
+        return_content: true
+      register: existing_tunnels
+
+    - name: Delete existing tunnel if found
+      uri:
+        url: "https://api.cloudflare.com/client/v4/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ item.id }}"
+        method: DELETE
+        headers:
+          X-Auth-Key: "{{ cloudflare_api_key }}"
+          X-Auth-Email: "{{ cloudflare_email }}"
+      when: item.name == "{{ app_name }}"
+      with_items: "{{ existing_tunnels.json.result }}"
+
+    - name: Create new Cloudflare tunnel
+      uri:
+        url: "https://api.cloudflare.com/client/v4/accounts/{{ cloudflare_account_id }}/cfd_tunnel"
+        method: POST
+        headers:
+          X-Auth-Key: "{{ cloudflare_api_key }}"
+          X-Auth-Email: "{{ cloudflare_email }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ app_name }}"
+      register: tunnel_create_response
+
     - name: Run cloudflared service install with token
-      command: cloudflared service install {{ cloudflare_tunnel_token }}
+      command: cloudflared service install {{ tunnel_create_response.json.result.token }}
       environment:
         HOME: /root
       args:
@@ -152,17 +200,17 @@
 
     - name: Set tunnel public hostname
       uri:
-        url: "https://api.cloudflare.com/client/v4/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cloudflare_tunnel_id }}/configurations"
+        url: "https://api.cloudflare.com/client/v4/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ tunnel_create_response.json.result.id }}/configurations"
         method: PUT
         headers:
-          X-Auth-Key: "{{ cloudflare_api_token }}"
+          X-Auth-Key: "{{ cloudflare_api_key }}"
           X-Auth-Email: "{{ cloudflare_email }}"
           Content-Type: "application/json"
         body_format: json
         body:
           config:
             ingress:
-              - hostname: "{{ github_repo_name }}.{{ cloudflare_domain }}"
+              - hostname: "{{ app_name }}.{{ cloudflare_domain }}"
                 service: "http://localhost:3000"
               - service: http_status:404
       delegate_to: localhost
@@ -176,3 +224,21 @@
         name: cloudflared
         enabled: yes
         state: started
+
+    - name: Ensure DNS record exists and is updated if needed
+      community.general.cloudflare_dns:
+        zone: "{{ cloudflare_domain }}"
+        record: "{{ app_name }}.{{ cloudflare_domain }}"
+        type: CNAME
+        value: "{{ tunnel_create_response.json.result.id }}.cfargotunnel.com"
+        account_email: "{{ cloudflare_email }}"
+        account_api_key: "{{ cloudflare_api_key }}"
+        proxied: true
+        state: present
+
+    - name: Restart cloudflared to apply config
+      ansible.builtin.systemd:
+        name: cloudflared
+        state: restarted
+        enabled: true
+
