@@ -1,6 +1,7 @@
+---
 - name: Provision and Configure LXC Container on Proxmox
   hosts: proxmox
-  gather_facts: no
+  gather_facts: false
   vars_files:
     - ../secrets.yml  # Include your encrypted vault file here
   tasks:
@@ -132,3 +133,46 @@
     - name: Display the LXC container's IP address
       debug:
         msg: "The app is running and accessible at http://{{ lxc_ip }}:3000"
+
+    - name: Download cloudflared .deb
+      ansible.builtin.get_url:
+        url: https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+        dest: /tmp/cloudflared.deb
+
+    - name: Install cloudflared .deb package
+      ansible.builtin.apt:
+        deb: /tmp/cloudflared.deb
+
+    - name: Run cloudflared service install with token
+      command: cloudflared service install {{ cloudflare_tunnel_token }}
+      environment:
+        HOME: /root
+      args:
+        creates: /etc/systemd/system/cloudflared.service
+
+    - name: Set tunnel public hostname
+      uri:
+        url: "https://api.cloudflare.com/client/v4/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cloudflare_tunnel_id }}/configurations"
+        method: PUT
+        headers:
+          X-Auth-Key: "{{ cloudflare_api_token }}"
+          X-Auth-Email: "{{ cloudflare_email }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          config:
+            ingress:
+              - hostname: "{{ github_repo_name }}.{{ cloudflare_domain }}"
+                service: "http://localhost:3000"
+              - service: http_status:404
+      delegate_to: localhost
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Ensure cloudflared service is enabled and running
+      ansible.builtin.systemd:
+        name: cloudflared
+        enabled: yes
+        state: started

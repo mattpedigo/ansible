@@ -5,6 +5,9 @@ secrets*.yml
 *secret.yml
 secret*.yml
 
+# ansible
+.lock
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
