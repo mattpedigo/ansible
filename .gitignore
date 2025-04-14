@@ -8,6 +8,9 @@ secret*.yml
 # ansible
 .lock
 
+# vscode
+.vscode
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
