@@ -237,8 +237,9 @@
         state: present
 
     - name: Restart cloudflared to apply config
-      ansible.builtin.systemd:
+      ansible.builtin.systemd_service:
         name: cloudflared
         state: restarted
+        daemon_reload: true
         enabled: true
 
